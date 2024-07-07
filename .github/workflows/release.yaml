@@ -1,0 +1,221 @@
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  FLUTTER_VERSION: 3.22.2
+  XCODE_VERSION: ^15.0.1
+
+name: Release
+
+jobs:
+  release_mobile:
+    name: Release on mobile
+    runs-on: ${{ matrix.runner }}
+    environment: prod
+
+    strategy:
+      matrix:
+        include:
+          - os: android
+            runner: ubuntu-latest
+          - os: ios
+            runner: macos-latest
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+          cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:-${{ hashFiles('**/pubspec.lock') }}"
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Setup Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "ruby"
+          bundler-cache: true
+          working-directory: ${{ matrix.os }}
+
+      - name: Setup Java
+        if: matrix.os == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin" # See 'Supported distributions' for available options
+          java-version: "17"
+
+      - name: Select Xcode version
+        if: matrix.os == 'ios'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Prepare Android release
+        if: matrix.os == 'android'
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_STORE_PASS: ${{ secrets.ANDROID_STORE_PASS }}
+          ANDROID_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          PLAYSTORE_DEPLOY_KEY: ${{ secrets.PLAYSTORE_DEPLOY_KEY }}
+        run: ../scripts/prepare-android-release.sh
+        working-directory: ${{ matrix.os }}
+
+      - name: Prepare iOS release
+        if: matrix.os == 'ios'
+        run: ./scripts/prepare-ios.sh
+
+      - name: Release on Play Store internal track
+        if: matrix.os == 'android'
+        run: ./scripts/release-playstore-beta.sh
+
+      - name: Release on TestFlight
+        if: matrix.os == 'ios'
+        env:
+          APPLE_CERTIFICATES_SSH_KEY: ${{ secrets.APPLE_CERTIFICATES_SSH_KEY }}
+          APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+          APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
+          APPLE_KEY_CONTENT: ${{ secrets.APPLE_KEY_CONTENT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        run: ../scripts/release-ios-testflight.sh
+        working-directory: ${{ matrix.os }}
+
+      - name: Build Android APK
+        if: matrix.os == 'android'
+        run: ./scripts/release-android-apk.sh
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'android'
+        with:
+          name: twake-release-${{ matrix.os }}
+          path: twake-${{ github.ref_name }}*
+
+  package_desktop:
+    name: Package app on desktops
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: macos
+            runner: macos-latest
+          - os: windows
+            runner: windows-latest
+          - os: linux
+            runner: ubuntu-latest
+      fail-fast: false
+    environment: prod
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+          cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:-${{ hashFiles('**/pubspec.lock') }}"
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Setup
+        run: |
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          flutter pub global activate flutter_distributor
+        shell: bash
+
+      - name: Setup Fastlane (macOS only)
+        uses: ruby/setup-ruby@v1
+        if: matrix.os == 'macos'
+        with:
+          ruby-version: ruby
+          bundler-cache: true
+          working-directory: ${{ matrix.os }}
+
+      - name: Build
+        env:
+          APPLE_CERTIFICATES_SSH_KEY: ${{ secrets.APPLE_CERTIFICATES_SSH_KEY }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+        run: ./scripts/build-${{ matrix.os }}.sh
+        shell: bash
+
+      - name: Package
+        run: ./scripts/package-${{ matrix.os }}.sh
+        shell: bash
+
+      - name: Prepare files for release
+        env:
+          APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
+          APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
+          APPLE_KEY_CONTENT: ${{ secrets.APPLE_KEY_CONTENT }}
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              cp dist/* "twake-$GITHUB_REF_NAME-linux-amd64.AppImage";;
+            macOS)
+              cp dist/*/* "twake-$GITHUB_REF_NAME-macos-amd64.dmg"
+              # Notarize the app
+              cd macos && bundle exec fastlane notarization
+              ;;
+            Windows)
+              cp dist/*/* "twake-$GITHUB_REF_NAME-windows-amd64.exe";;
+          esac
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: twake-release-${{ matrix.os }}
+          path: twake-${{ github.ref_name }}*
+
+  release_github:
+    name: Release on Github
+    runs-on: ubuntu-latest
+    needs:
+      - package_desktop
+      - release_mobile
+    environment: prod
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: twake-release*
+          merge-multiple: true
+
+      - name: Calculate checksums
+        id: shasum
+        run: |
+          shasum -a 256 -b twake-$GITHUB_REF_NAME* > SHA256SUMS
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "checksum<<$EOF" >> $GITHUB_OUTPUT
+          echo "$(cat SHA256SUMS)" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for full changelogs.
+
+            ### Checksums
+
+            ```
+            ${{ steps.shasum.outputs.checksum }}
+            ```
+          files: |
+            twake-${{ github.ref_name }}*
+            SHA256SUMS

@@ -1,0 +1,93 @@
+on:
+  pull_request:
+
+env:
+  FLUTTER_VERSION: 3.22.2
+  LIBOLM_VERSION: 3.2.16
+
+name: Deploying on GitHub Pages
+
+jobs:
+  deploy_preview:
+    name: Deploy preview versions on pull requests
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+    permissions:
+      deployments: write
+      pull-requests: write
+      contents: write
+
+    environment:
+      name: PR-${{ github.event.pull_request.number }}
+      url: ${{ steps.configure.outputs.URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: "stable"
+          cache: true
+          cache-key: "flutter-:os:-:channel:-:version:-:arch:-:hash:-${{ hashFiles('**/pubspec.lock') }}"
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_KEY }}
+
+      - name: Setup Nix (to build libolm)
+        uses: cachix/install-nix-action@v26
+
+      - name: Build libolm
+        run: |
+          rm -rf assets/js
+          nix build -v "gitlab:matrix-org/olm/$LIBOLM_VERSION?host=gitlab.matrix.org#javascript" -o assets/js
+          sudo chmod 777 -R assets/js
+          cd assets/js/ && mv javascript package
+
+      - name: Build Web version
+        env:
+          FOLDER: ${{ github.event.pull_request.number }}
+          TWAKE_PREVIEW_CONFIG: ${{ secrets.TWAKE_PREVIEW_CONFIG }}
+        run: |
+          flutter config --enable-web
+          flutter clean
+          flutter pub get
+          flutter pub run build_runner build --delete-conflicting-outputs
+          flutter build web --release --verbose --source-maps --base-href="/${GITHUB_REPOSITORY##*/}/$FOLDER/"
+          echo "$TWAKE_PREVIEW_CONFIG" | yq '.issue_id = strenv(FOLDER)' > ./build/web/config.json
+
+      - name: Configure environments
+        id: configure
+        env:
+          FOLDER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "URL=https://$GITHUB_REPOSITORY_OWNER.github.io/${GITHUB_REPOSITORY##*/}/$FOLDER" >> $GITHUB_OUTPUT
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: build/web
+          keep_files: true
+          destination_dir: "${{ github.event.pull_request.number }}"
+
+      - name: Find deployment comment
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          comment-author: "github-actions[bot]"
+          issue-number: ${{ github.event.pull_request.number }}
+          body-includes: "This PR has been deployed to"
+
+      - name: Create or update deployment comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            This PR has been deployed to ${{ steps.configure.outputs.URL }}
+          edit-mode: replace

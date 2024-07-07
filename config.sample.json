@@ -1,0 +1,15 @@
+{
+  "application_name": "Twake Chat",
+  "application_welcome_message": "Welcome to Twake Chat!",
+  "default_homeserver": "matrix.linagora.com",
+  "privacy_url": "https://twake.app/en/privacy/",
+  "render_html": true,
+  "hide_redacted_events": false,
+  "hide_unknown_events": false,
+  "issue_id": "",
+  "registration_url": "https://example.com/",
+  "twake_workplace_homeserver": "https://example.com/",
+  "app_grid_dashboard_available": true,
+  "homeserver": "https://example.com/",
+  "platform": "platform"
+}
